@@ -1,0 +1,8 @@
+.gocache
+.gopath
+.git
+.env
+.env.*
+.dev.vars
+node_modules
+build

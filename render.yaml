@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: webhook-catcher-api
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: REQUIRE_ACCESS
+        value: "false"
+      - key: MIGRATIONS_AUTO_APPLY
+        value: "true"
+      - key: DATABASE_URL
+        value: "file:/app/data/webhook_catcher.db?_pragma=busy_timeout(5000)"
