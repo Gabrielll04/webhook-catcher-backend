@@ -1,12 +1,15 @@
 package tests
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"webhook-catcher/internal/app"
 	"webhook-catcher/internal/infra/config"
@@ -173,6 +176,183 @@ func TestAdminCORSPreflightAndOriginValidation(t *testing.T) {
 	assertErrorEnvelope(t, forbiddenResp)
 }
 
+func TestHookOptionsDoesNotPersist(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "hook-options"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	token := created["token"].(string)
+	inboxID := created["id"].(string)
+
+	resp := doJSON(t, ts, http.MethodOptions, "/hook/"+token, nil, map[string]string{"Origin": "http://localhost:3000"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	listResp := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests", nil, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", listResp.StatusCode)
+	}
+	var listBody struct {
+		Data []map[string]any `json:"data"`
+	}
+	decodeResp(t, listResp, &listBody)
+	if len(listBody.Data) != 0 {
+		t.Fatalf("expected 0 captured requests, got %d", len(listBody.Data))
+	}
+}
+
+func TestCreateInboxRejectsEmptyPayload(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	resp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", nil, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	assertErrorEnvelope(t, resp)
+}
+
+func TestCreateInboxIdempotencyKey(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	headers := map[string]string{"Idempotency-Key": "test-key-1"}
+	resp1 := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "idem"}, headers)
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("expected first call 201, got %d", resp1.StatusCode)
+	}
+	var body1 map[string]any
+	decodeResp(t, resp1, &body1)
+
+	resp2 := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "idem"}, headers)
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("expected second call 201, got %d", resp2.StatusCode)
+	}
+	var body2 map[string]any
+	decodeResp(t, resp2, &body2)
+
+	if body1["id"] != body2["id"] {
+		t.Fatalf("expected same id for idempotent replay")
+	}
+
+	listResp := doJSON(t, ts, http.MethodGet, "/v1/inboxes", nil, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", listResp.StatusCode)
+	}
+	var listBody struct {
+		Total float64 `json:"total"`
+	}
+	decodeResp(t, listResp, &listBody)
+	if int(listBody.Total) != 1 {
+		t.Fatalf("expected total 1 inbox, got %d", int(listBody.Total))
+	}
+}
+
+func TestInboxStreamReceivesCapturedRequest(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "stream"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+	token := created["token"].(string)
+
+	streamReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/inboxes/"+inboxID+"/stream", nil)
+	if err != nil {
+		t.Fatalf("new stream request: %v", err)
+	}
+	streamReq.Header.Set("Accept", "text/event-stream")
+	streamResp, err := http.DefaultClient.Do(streamReq)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(streamResp.Body)
+		t.Fatalf("expected 200 stream, got %d body=%s", streamResp.StatusCode, string(body))
+	}
+
+	dataCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(streamResp.Body)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				errCh <- readErr
+				return
+			}
+			if strings.HasPrefix(line, "data: ") {
+				dataCh <- strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+				return
+			}
+		}
+	}()
+
+	hookReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token, bytes.NewBufferString("{\"live\":true}"))
+	hookReq.Header.Set("Content-Type", "application/json")
+	hookResp, err := http.DefaultClient.Do(hookReq)
+	if err != nil {
+		t.Fatalf("hook request failed: %v", err)
+	}
+	defer hookResp.Body.Close()
+	if hookResp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(hookResp.Body)
+		t.Fatalf("expected 204 hook, got %d body=%s", hookResp.StatusCode, string(body))
+	}
+
+	select {
+	case payload := <-dataCh:
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			t.Fatalf("invalid stream payload: %v", err)
+		}
+		if event["inbox_id"] != inboxID {
+			t.Fatalf("expected inbox_id %s, got %v", inboxID, event["inbox_id"])
+		}
+		if event["method"] != http.MethodPost {
+			t.Fatalf("expected method POST, got %v", event["method"])
+		}
+	case readErr := <-errCh:
+		t.Fatalf("stream read failed: %v", readErr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for stream event")
+	}
+}
 func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, headers map[string]string) *http.Response {
 	t.Helper()
 	var reader io.Reader

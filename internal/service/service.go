@@ -124,20 +124,20 @@ type CaptureInput struct {
 	ReceivedAt  time.Time
 }
 
-func (s *Services) CaptureRequest(ctx context.Context, in CaptureInput) error {
+func (s *Services) CaptureRequest(ctx context.Context, in CaptureInput) (*domain.CapturedRequest, error) {
 	if int64(len(in.BodyRaw)) > s.maxPayloadBytes {
-		return domain.ErrPayloadTooLarge
+		return nil, domain.ErrPayloadTooLarge
 	}
 	inbox, err := s.store.GetInboxByToken(ctx, in.Token)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if inbox.Status == domain.InboxStatusDisabled {
-		return domain.ErrInboxDisabled
+		return nil, domain.ErrInboxDisabled
 	}
 	idValue, err := id.NewULID(in.ReceivedAt)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	h := sha256.Sum256(in.BodyRaw)
 	requestHash := hex.EncodeToString(h[:])
@@ -158,7 +158,18 @@ func (s *Services) CaptureRequest(ctx context.Context, in CaptureInput) error {
 		TruncatedBody: false,
 	}
 	if err := s.store.CreateCapturedRequest(ctx, &req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+func (s *Services) ValidateCaptureTarget(ctx context.Context, token string) error {
+	inbox, err := s.store.GetInboxByToken(ctx, token)
+	if err != nil {
 		return err
+	}
+	if inbox.Status == domain.InboxStatusDisabled {
+		return domain.ErrInboxDisabled
 	}
 	return nil
 }

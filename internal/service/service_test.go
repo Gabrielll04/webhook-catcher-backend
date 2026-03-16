@@ -56,7 +56,7 @@ func TestCapturePayloadTooLarge(t *testing.T) {
 		t.Fatalf("create inbox: %v", err)
 	}
 
-	err = svc.CaptureRequest(context.Background(), CaptureInput{
+	_, err = svc.CaptureRequest(context.Background(), CaptureInput{
 		Token:       out.Inbox.Token,
 		Method:      "POST",
 		Path:        "/hook/" + out.Inbox.Token,
@@ -81,7 +81,7 @@ func TestRetentionUsesInboxOverride(t *testing.T) {
 		t.Fatalf("create inbox: %v", err)
 	}
 
-	err = svc.CaptureRequest(context.Background(), CaptureInput{
+	_, err = svc.CaptureRequest(context.Background(), CaptureInput{
 		Token:       out.Inbox.Token,
 		Method:      "POST",
 		Path:        "/hook/" + out.Inbox.Token,

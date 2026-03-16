@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"webhook-catcher/internal/domain"
@@ -35,7 +37,21 @@ type API struct {
 	limiter            *ratelimit.Limiter
 	corsAllowAnyOrigin bool
 	corsAllowedOrigins map[string]struct{}
+	idempoMu           sync.Mutex
+	idempoResponses    map[string]idempotencyEntry
+	sse                *sseBroker
 }
+
+type idempotencyEntry struct {
+	StatusCode int
+	Body       []byte
+	ExpiresAt  time.Time
+}
+
+const (
+	maxAdminPayloadBytes = 1024 * 1024
+	idempotencyTTL       = 24 * time.Hour
+)
 
 func New(cfg config.Config, services *service.Services, logger *logging.Logger, recorder metrics.Recorder) *API {
 	corsAllowAnyOrigin, corsAllowedOrigins := parseAllowedOrigins(cfg.CORSAllowedOrigins)
@@ -48,6 +64,8 @@ func New(cfg config.Config, services *service.Services, logger *logging.Logger, 
 		limiter:            ratelimit.New(cfg.AdminRateLimitRPM),
 		corsAllowAnyOrigin: corsAllowAnyOrigin,
 		corsAllowedOrigins: corsAllowedOrigins,
+		idempoResponses:    make(map[string]idempotencyEntry),
+		sse:                newSSEBroker(),
 	}
 }
 
@@ -99,7 +117,7 @@ func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/ready" {
 		if err := a.services.Ready(r.Context()); err != nil {
-			writeError(w, http.StatusServiceUnavailable, reqID, "not_ready", "Dependências indisponíveis", nil)
+			writeError(w, http.StatusServiceUnavailable, reqID, "not_ready", "DependÃƒÂªncias indisponÃƒÂ­veis", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
@@ -117,7 +135,7 @@ func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
 		a.handleInboxes(w, r)
 		return
 	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota não encontrada", nil)
+	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÂ£o encontrada", nil)
 }
 
 func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +148,7 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			a.handleListInboxes(w, r)
 		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Método não suportado", nil)
+			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
 		}
 		return
 	}
@@ -144,7 +162,7 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		case http.MethodDelete:
 			a.handleDeleteInbox(w, r, id)
 		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Método não suportado", nil)
+			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
 		}
 		return
 	}
@@ -152,11 +170,15 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		a.handleListRequests(w, r, segments[2])
 		return
 	}
+	if len(segments) == 4 && segments[3] == "stream" && r.Method == http.MethodGet {
+		a.handleInboxStream(w, r, segments[2])
+		return
+	}
 	if len(segments) == 5 && segments[3] == "requests" && r.Method == http.MethodGet {
 		a.handleGetRequestDetails(w, r, segments[2], segments[4])
 		return
 	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota não encontrada", nil)
+	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÂ£o encontrada", nil)
 }
 
 type createInboxReq struct {
@@ -167,11 +189,26 @@ type createInboxReq struct {
 
 func (a *API) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	var req createInboxReq
-	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_json", "JSON inválido", nil)
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Metodo nao suportado", nil)
 		return
 	}
+
+	var req createInboxReq
+	if err := decodeJSONPayload(r, &req, true); err != nil {
+		a.writeJSONPayloadError(w, reqID, err)
+		return
+	}
+
+	idempoKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if statusCode, body, ok := a.readIdempotencyResponse(r.Method, r.URL.Path, idempoKey); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Idempotent-Replay", "true")
+		w.WriteHeader(statusCode)
+		_, _ = w.Write(body)
+		return
+	}
+
 	out, err := a.services.CreateInbox(r.Context(), service.CreateInboxInput{
 		Name:          req.Name,
 		Description:   req.Description,
@@ -184,7 +221,8 @@ func (a *API) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 		a.handleServiceError(w, reqID, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+
+	response := map[string]any{
 		"id":                 out.Inbox.ID,
 		"name":               out.Inbox.Name,
 		"token":              out.Inbox.Token,
@@ -193,7 +231,16 @@ func (a *API) handleCreateInbox(w http.ResponseWriter, r *http.Request) {
 		"retention_days":     out.Inbox.RetentionDays,
 		"public_capture_url": out.PublicCaptureURL,
 		"created_at":         out.Inbox.CreatedAt.UTC().Format(time.RFC3339Nano),
-	})
+	}
+	payload, _ := json.Marshal(response)
+	payload = append(payload, '\n')
+	if idempoKey != "" {
+		a.storeIdempotencyResponse(r.Method, r.URL.Path, idempoKey, http.StatusCreated, payload)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write(payload)
+
 	if active, err := a.services.ActiveInboxes(r.Context()); err == nil {
 		a.metrics.SetActiveInboxes(r.Context(), active)
 	}
@@ -235,8 +282,8 @@ type patchInboxReq struct {
 func (a *API) handlePatchInbox(w http.ResponseWriter, r *http.Request, id string) {
 	reqID := requestIDFromContext(r.Context())
 	var req patchInboxReq
-	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_json", "JSON inválido", nil)
+	if err := decodeJSONPayload(r, &req, true); err != nil {
+		a.writeJSONPayloadError(w, reqID, err)
 		return
 	}
 	inbox, err := a.services.UpdateInbox(r.Context(), id, domain.InboxPatch{
@@ -269,26 +316,46 @@ func (a *API) handleDeleteInbox(w http.ResponseWriter, r *http.Request, id strin
 
 func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	method := strings.ToUpper(r.Method)
+	if method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !isAllowedCaptureMethod(method) {
+		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Metodo nao suportado", nil)
+		return
+	}
+
 	token := strings.TrimPrefix(r.URL.Path, "/hook/")
 	if token == "" {
-		writeError(w, http.StatusNotFound, reqID, "inbox_not_found", "Inbox não encontrada", nil)
+		writeError(w, http.StatusNotFound, reqID, "inbox_not_found", "Inbox nao encontrada", nil)
+		return
+	}
+
+	if err := a.services.ValidateCaptureTarget(r.Context(), token); err != nil {
+		a.handleServiceError(w, reqID, err)
 		return
 	}
 
 	limited := io.LimitReader(r.Body, a.cfg.MaxPayloadBytes+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "malformed_request", "Não foi possível ler o payload", nil)
+		writeError(w, http.StatusBadRequest, reqID, "malformed_request", "Nao foi possivel ler o payload", nil)
 		return
 	}
 	if int64(len(body)) > a.cfg.MaxPayloadBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, reqID, "payload_too_large", "Payload acima do limite", map[string]any{"max_bytes": a.cfg.MaxPayloadBytes})
 		return
 	}
+	if requiresPayload(method) && len(bytes.TrimSpace(body)) == 0 {
+		writeError(w, http.StatusBadRequest, reqID, "invalid_payload", "Payload vazio nao permitido", nil)
+		return
+	}
 
-	err = a.services.CaptureRequest(r.Context(), service.CaptureInput{
+	receivedAt := time.Now().UTC()
+	captured, err := a.services.CaptureRequest(r.Context(), service.CaptureInput{
 		Token:       token,
-		Method:      r.Method,
+		Method:      method,
 		Path:        r.URL.Path,
 		QueryParams: service.ExtractQueryParams(r),
 		Headers:     service.ExtractHeaders(r),
@@ -296,7 +363,7 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 		ContentType: r.Header.Get("Content-Type"),
 		RemoteIP:    clientIP(r),
 		UserAgent:   r.UserAgent(),
-		ReceivedAt:  time.Now().UTC(),
+		ReceivedAt:  receivedAt,
 	})
 	if err != nil {
 		a.handleServiceError(w, reqID, err)
@@ -307,15 +374,82 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.metrics.CaptureRecorded(r.Context(), token, int64(len(body)))
+	a.publishCapturedRequest(captured)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (a *API) handleInboxStream(w http.ResponseWriter, r *http.Request, inboxID string) {
+	reqID := requestIDFromContext(r.Context())
+	if _, err := a.services.GetInbox(r.Context(), inboxID); err != nil {
+		a.handleServiceError(w, reqID, err)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, reqID, "stream_not_supported", "Streaming nao suportado", nil)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(": connected\n\n"))
+	flusher.Flush()
+
+	events, cancel := a.sse.Subscribe(inboxID)
+	defer cancel()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case payload, ok := <-events:
+			if !ok {
+				return
+			}
+			_, _ = w.Write([]byte("event: captured_request\n"))
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(payload)
+			_, _ = w.Write([]byte("\n\n"))
+			flusher.Flush()
+		case <-heartbeat.C:
+			_, _ = w.Write([]byte(": ping\n\n"))
+			flusher.Flush()
+		}
+	}
+}
+
+func (a *API) publishCapturedRequest(item *domain.CapturedRequest) {
+	if item == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"id":              item.ID,
+		"inbox_id":        item.InboxID,
+		"method":          item.Method,
+		"path":            item.Path,
+		"content_type":    item.ContentType,
+		"body_size_bytes": item.BodySizeBytes,
+		"remote_ip":       item.RemoteIP,
+		"received_at":     item.ReceivedAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return
+	}
+	a.sse.Publish(item.InboxID, payload)
+}
 func (a *API) handleListRequests(w http.ResponseWriter, r *http.Request, inboxID string) {
 	reqID := requestIDFromContext(r.Context())
 	page := readPage(r)
 	filter, err := readFilter(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro inválido", nil)
+		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invÃƒÂ¡lido", nil)
 		return
 	}
 	items, total, err := a.services.ListRequests(r.Context(), inboxID, filter, page)
@@ -362,12 +496,12 @@ func (a *API) handleGetRequestDetails(w http.ResponseWriter, r *http.Request, in
 func (a *API) handleRetention(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Método não suportado", nil)
+		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
 		return
 	}
 	if a.cfg.CronSecret != "" {
 		if r.Header.Get("X-Cron-Secret") != a.cfg.CronSecret {
-			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron não autorizado", nil)
+			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron nÃƒÂ£o autorizado", nil)
 			return
 		}
 	}
@@ -410,10 +544,95 @@ func (a *API) logRequest(r *http.Request, requestID string, status int, start ti
 	})
 }
 
-func decodeJSON(body io.Reader, out any) error {
-	dec := json.NewDecoder(body)
+func decodeJSONPayload(r *http.Request, out any, requireBody bool) error {
+	limited := io.LimitReader(r.Body, maxAdminPayloadBytes+1)
+	payload, err := io.ReadAll(limited)
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxAdminPayloadBytes {
+		return domain.ErrPayloadTooLarge
+	}
+	if requireBody && len(bytes.TrimSpace(payload)) == 0 {
+		return io.EOF
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
-	return dec.Decode(out)
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("invalid_json_trailing")
+	}
+	return nil
+}
+
+func (a *API) writeJSONPayloadError(w http.ResponseWriter, reqID string, err error) {
+	switch {
+	case errors.Is(err, io.EOF):
+		writeError(w, http.StatusBadRequest, reqID, "invalid_payload", "Payload vazio nao permitido", nil)
+	case errors.Is(err, domain.ErrPayloadTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, reqID, "payload_too_large", "Payload acima do limite", map[string]any{"max_bytes": maxAdminPayloadBytes})
+	default:
+		writeError(w, http.StatusBadRequest, reqID, "invalid_json", "JSON invalido", nil)
+	}
+}
+
+func (a *API) readIdempotencyResponse(method, path, key string) (int, []byte, bool) {
+	if key == "" {
+		return 0, nil, false
+	}
+	cacheKey := method + ":" + path + ":" + key
+	now := time.Now().UTC()
+	a.idempoMu.Lock()
+	defer a.idempoMu.Unlock()
+	for k, v := range a.idempoResponses {
+		if now.After(v.ExpiresAt) {
+			delete(a.idempoResponses, k)
+		}
+	}
+	entry, ok := a.idempoResponses[cacheKey]
+	if !ok || now.After(entry.ExpiresAt) {
+		return 0, nil, false
+	}
+	body := make([]byte, len(entry.Body))
+	copy(body, entry.Body)
+	return entry.StatusCode, body, true
+}
+
+func (a *API) storeIdempotencyResponse(method, path, key string, statusCode int, body []byte) {
+	if key == "" {
+		return
+	}
+	cacheKey := method + ":" + path + ":" + key
+	bodyCopy := make([]byte, len(body))
+	copy(bodyCopy, body)
+	a.idempoMu.Lock()
+	a.idempoResponses[cacheKey] = idempotencyEntry{
+		StatusCode: statusCode,
+		Body:       bodyCopy,
+		ExpiresAt:  time.Now().UTC().Add(idempotencyTTL),
+	}
+	a.idempoMu.Unlock()
+}
+
+func isAllowedCaptureMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead:
+		return true
+	default:
+		return false
+	}
+}
+
+func requiresPayload(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return true
+	default:
+		return false
+	}
 }
 
 func requestIDFromContext(ctx context.Context) string {
@@ -539,7 +758,7 @@ func (a *API) handleAdminCORS(w http.ResponseWriter, r *http.Request, reqID stri
 		return false
 	}
 	if !a.isOriginAllowed(origin) {
-		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem não permitida por CORS", nil)
+		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem nÃƒÂ£o permitida por CORS", nil)
 		a.logRequest(r, reqID, http.StatusForbidden, start)
 		a.metrics.RouteLatency(ctx, routeKey(r), http.StatusForbidden, time.Since(start).Milliseconds())
 		return true
@@ -624,6 +843,11 @@ type statusWriter struct {
 	status int
 }
 
+func (w *statusWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
 func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
