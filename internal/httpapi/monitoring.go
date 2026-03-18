@@ -13,32 +13,6 @@ import (
 
 const monitoringLiveChannelKey = "__monitoring_live__"
 
-func (a *API) handleMonitoring(w http.ResponseWriter, r *http.Request) {
-	reqID := requestIDFromContext(r.Context())
-	segments := splitPath(r.URL.Path)
-	if len(segments) == 3 {
-		switch {
-		case segments[2] == "summary" && r.Method == http.MethodGet:
-			a.handleMonitoringSummary(w, r)
-			return
-		case segments[2] == "timeseries" && r.Method == http.MethodGet:
-			a.handleMonitoringTimeseries(w, r)
-			return
-		case segments[2] == "breakdown" && r.Method == http.MethodGet:
-			a.handleMonitoringBreakdown(w, r)
-			return
-		case segments[2] == "live" && r.Method == http.MethodGet:
-			a.handleMonitoringLiveStream(w, r)
-			return
-		}
-	}
-	if len(segments) == 4 && segments[2] == "inboxes" && segments[3] == "health" && r.Method == http.MethodGet {
-		a.handleMonitoringInboxesHealth(w, r)
-		return
-	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nao encontrada", nil)
-}
-
 func (a *API) handleMonitoringSummary(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	q, err := readMonitoringQuery(r)

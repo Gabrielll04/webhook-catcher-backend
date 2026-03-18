@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"webhook-catcher/internal/domain"
 	"webhook-catcher/internal/infra/access"
 	"webhook-catcher/internal/infra/config"
@@ -33,6 +35,7 @@ type API struct {
 	services           *service.Services
 	logger             *logging.Logger
 	metrics            metrics.Recorder
+	router             http.Handler
 	access             access.Validator
 	limiter            *ratelimit.Limiter
 	corsAllowAnyOrigin bool
@@ -56,7 +59,7 @@ const (
 
 func New(cfg config.Config, services *service.Services, logger *logging.Logger, recorder metrics.Recorder) *API {
 	corsAllowAnyOrigin, corsAllowedOrigins := parseAllowedOrigins(cfg.CORSAllowedOrigins)
-	return &API{
+	api := &API{
 		cfg:                cfg,
 		services:           services,
 		logger:             logger,
@@ -68,8 +71,9 @@ func New(cfg config.Config, services *service.Services, logger *logging.Logger, 
 		idempoResponses:    make(map[string]idempotencyEntry),
 		sse:                newSSEBroker(),
 	}
+	api.router = api.newRouter()
+	return api
 }
-
 func (a *API) Handler() http.Handler {
 	return http.HandlerFunc(a.serveHTTP)
 }
@@ -91,7 +95,7 @@ func (a *API) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		headers := flattenHeaders(r.Header)
 		if !a.access.Validate(headers) {
-			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Access nÃ£o autorizado", nil)
+			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Access nao autorizado", nil)
 			a.logRequest(r, reqID, http.StatusUnauthorized, start)
 			a.metrics.RouteLatency(ctx, routeKey(r), http.StatusUnauthorized, time.Since(start).Milliseconds())
 			return
@@ -105,85 +109,9 @@ func (a *API) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-	a.dispatch(rw, r)
+	a.router.ServeHTTP(rw, r)
 	a.logRequest(r, reqID, rw.status, start)
 	a.metrics.RouteLatency(ctx, routeKey(r), rw.status, time.Since(start).Milliseconds())
-}
-
-func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
-	reqID := requestIDFromContext(r.Context())
-	if r.URL.Path == "/health" {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC().Format(time.RFC3339Nano)})
-		return
-	}
-	if r.URL.Path == "/ready" {
-		if err := a.services.Ready(r.Context()); err != nil {
-			writeError(w, http.StatusServiceUnavailable, reqID, "not_ready", "DependÃƒÆ’Ã‚Âªncias indisponÃƒÆ’Ã‚Â­veis", nil)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
-		return
-	}
-	if r.URL.Path == "/internal/retention/run" {
-		a.handleRetention(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/hook/") {
-		a.handleCapture(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/monitoring") {
-		a.handleMonitoring(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/v1/inboxes") {
-		a.handleInboxes(w, r)
-		return
-	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÆ’Ã‚Â£o encontrada", nil)
-}
-
-func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
-	reqID := requestIDFromContext(r.Context())
-	segments := splitPath(r.URL.Path)
-	if len(segments) == 2 {
-		switch r.Method {
-		case http.MethodPost:
-			a.handleCreateInbox(w, r)
-		case http.MethodGet:
-			a.handleListInboxes(w, r)
-		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
-		}
-		return
-	}
-	if len(segments) == 3 {
-		id := segments[2]
-		switch r.Method {
-		case http.MethodGet:
-			a.handleGetInbox(w, r, id)
-		case http.MethodPatch:
-			a.handlePatchInbox(w, r, id)
-		case http.MethodDelete:
-			a.handleDeleteInbox(w, r, id)
-		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
-		}
-		return
-	}
-	if len(segments) == 4 && segments[3] == "requests" && r.Method == http.MethodGet {
-		a.handleListRequests(w, r, segments[2])
-		return
-	}
-	if len(segments) == 4 && segments[3] == "stream" && r.Method == http.MethodGet {
-		a.handleInboxStream(w, r, segments[2])
-		return
-	}
-	if len(segments) == 5 && segments[3] == "requests" && r.Method == http.MethodGet {
-		a.handleGetRequestDetails(w, r, segments[2], segments[4])
-		return
-	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÆ’Ã‚Â£o encontrada", nil)
 }
 
 type createInboxReq struct {
@@ -365,7 +293,10 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := strings.TrimPrefix(r.URL.Path, "/hook/")
+	token := strings.TrimSpace(chi.URLParam(r, "token"))
+	if token == "" {
+		token = strings.TrimPrefix(r.URL.Path, "/hook/")
+	}
 	if token == "" {
 		responseStatus = http.StatusNotFound
 		writeError(w, responseStatus, reqID, "inbox_not_found", "Inbox nao encontrada", nil)
@@ -503,7 +434,7 @@ func (a *API) handleListRequests(w http.ResponseWriter, r *http.Request, inboxID
 	page := readPage(r)
 	filter, err := readFilter(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invÃƒÆ’Ã‚Â¡lido", nil)
+		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invalido", nil)
 		return
 	}
 	items, total, err := a.services.ListRequests(r.Context(), inboxID, filter, page)
@@ -557,12 +488,12 @@ func (a *API) handleGetRequestDetails(w http.ResponseWriter, r *http.Request, in
 func (a *API) handleRetention(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
+		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Metodo nao suportado", nil)
 		return
 	}
 	if a.cfg.CronSecret != "" {
 		if r.Header.Get("X-Cron-Secret") != a.cfg.CronSecret {
-			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron nÃƒÆ’Ã‚Â£o autorizado", nil)
+			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron nao autorizado", nil)
 			return
 		}
 	}
@@ -578,9 +509,9 @@ func (a *API) handleServiceError(w http.ResponseWriter, requestID string, err er
 	status := statusCodeFromServiceError(err)
 	switch {
 	case errors.Is(err, domain.ErrInvalidInput):
-		writeError(w, status, requestID, "invalid_input", "Entrada invÃ¡lida", nil)
+		writeError(w, status, requestID, "invalid_input", "Entrada invalida", nil)
 	case errors.Is(err, domain.ErrNotFound):
-		writeError(w, status, requestID, "inbox_not_found", "Inbox nÃ£o encontrada", nil)
+		writeError(w, status, requestID, "inbox_not_found", "Inbox nao encontrada", nil)
 	case errors.Is(err, domain.ErrInboxDisabled):
 		writeError(w, status, requestID, "inbox_disabled", "Inbox desativada", nil)
 	case errors.Is(err, domain.ErrPayloadTooLarge):
@@ -750,14 +681,6 @@ func requestIDFromContext(ctx context.Context) string {
 	return v
 }
 
-func splitPath(path string) []string {
-	path = strings.Trim(path, "/")
-	if path == "" {
-		return nil
-	}
-	return strings.Split(path, "/")
-}
-
 func flattenHeaders(h http.Header) map[string]string {
 	result := make(map[string]string, len(h))
 	for k, vv := range h {
@@ -908,7 +831,7 @@ func (a *API) handleAdminCORS(w http.ResponseWriter, r *http.Request, reqID stri
 		return false
 	}
 	if !a.isOriginAllowed(origin) {
-		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem nÃƒÆ’Ã‚Â£o permitida por CORS", nil)
+		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem nao permitida por CORS", nil)
 		a.logRequest(r, reqID, http.StatusForbidden, start)
 		a.metrics.RouteLatency(ctx, routeKey(r), http.StatusForbidden, time.Since(start).Milliseconds())
 		return true

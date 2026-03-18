@@ -654,6 +654,34 @@ func TestMonitoringEndpointsAndLiveStream(t *testing.T) {
 		t.Fatalf("expected state in health response")
 	}
 }
+func TestRouterAcceptsTrailingSlashes(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes/", map[string]any{"name": "slash"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+
+	listResp := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests/?page=1&page_size=10", nil, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 list requests, got %d", listResp.StatusCode)
+	}
+
+	healthResp := doJSON(t, ts, http.MethodGet, "/health/", nil, nil)
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 health, got %d", healthResp.StatusCode)
+	}
+}
 func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, headers map[string]string) *http.Response {
 	t.Helper()
 	var reader io.Reader

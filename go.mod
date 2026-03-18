@@ -2,7 +2,10 @@ module webhook-catcher
 
 go 1.24.5
 
-require modernc.org/sqlite v1.39.1
+require (
+	github.com/go-chi/chi/v5 v5.2.5
+	modernc.org/sqlite v1.39.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
