@@ -24,6 +24,7 @@ type Store interface {
 	GetMonitoringTimeseries(ctx context.Context, q domain.MonitoringQuery) ([]domain.MonitoringTimeseriesPoint, error)
 	GetMonitoringBreakdown(ctx context.Context, q domain.MonitoringQuery, dimension string, limit int) ([]domain.MonitoringBreakdownItem, error)
 	ListMonitoringInboxStats(ctx context.Context, q domain.MonitoringQuery) ([]domain.MonitoringInboxStat, error)
+	ListMonitoringLiveEvents(ctx context.Context, q domain.MonitoringQuery, limit int) ([]domain.MonitoringLiveEvent, error)
 
 	DeleteExpiredCapturedRequests(ctx context.Context, now time.Time, defaultRetentionDays int) (int64, error)
 	CountActiveInboxes(ctx context.Context) (int, error)

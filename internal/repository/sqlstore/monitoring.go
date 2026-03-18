@@ -432,6 +432,66 @@ func (s *Store) ListMonitoringInboxStats(ctx context.Context, q domain.Monitorin
 	return result, nil
 }
 
+func (s *Store) ListMonitoringLiveEvents(ctx context.Context, q domain.MonitoringQuery, limit int) ([]domain.MonitoringLiveEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	whereClause, args := buildMonitoringEventsWhere(q)
+	query := fmt.Sprintf(`
+		SELECT observed_at, inbox_id, method, path, status_code, status_class, latency_ms, body_size_bytes, remote_ip, country, user_agent
+		FROM monitoring_hook_events
+		WHERE %s
+		ORDER BY observed_at DESC
+		LIMIT ?`, whereClause)
+	argsWithLimit := append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, argsWithLimit...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.MonitoringLiveEvent, 0, limit)
+	for rows.Next() {
+		var observedRaw string
+		var inboxID sql.NullString
+		item := domain.MonitoringLiveEvent{}
+		if err := rows.Scan(
+			&observedRaw,
+			&inboxID,
+			&item.Method,
+			&item.Path,
+			&item.StatusCode,
+			&item.StatusClass,
+			&item.LatencyMs,
+			&item.BodySizeBytes,
+			&item.RemoteIP,
+			&item.Country,
+			&item.UserAgent,
+		); err != nil {
+			return nil, err
+		}
+		observedAt, parseErr := time.Parse(time.RFC3339Nano, observedRaw)
+		if parseErr != nil {
+			observedAt, parseErr = time.Parse(time.RFC3339, observedRaw)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+		}
+		item.ObservedAt = observedAt.UTC()
+		if inboxID.Valid {
+			item.InboxID = inboxID.String
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
 func buildMonitoringEventsWhere(q domain.MonitoringQuery) (string, []any) {
 	where := []string{"observed_at >= ?", "observed_at <= ?"}
 	args := []any{q.From.UTC().Format(time.RFC3339Nano), q.To.UTC().Format(time.RFC3339Nano)}

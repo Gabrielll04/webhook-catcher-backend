@@ -278,6 +278,50 @@ func (s *Store) ListMonitoringInboxStats(_ context.Context, q domain.MonitoringQ
 	return out, nil
 }
 
+func (s *Store) ListMonitoringLiveEvents(_ context.Context, q domain.MonitoringQuery, limit int) ([]domain.MonitoringLiveEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	filtered := make([]domain.HookObservation, 0, len(s.monitoringEvents))
+	for _, obs := range s.monitoringEvents {
+		if !matchesMonitoringQuery(obs, q) {
+			continue
+		}
+		filtered = append(filtered, obs)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].ObservedAt.After(filtered[j].ObservedAt)
+	})
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].ObservedAt.Before(filtered[j].ObservedAt)
+	})
+
+	out := make([]domain.MonitoringLiveEvent, 0, len(filtered))
+	for _, obs := range filtered {
+		out = append(out, domain.MonitoringLiveEvent{
+			ObservedAt:    obs.ObservedAt,
+			InboxID:       obs.InboxID,
+			Method:        obs.Method,
+			Path:          obs.Path,
+			StatusCode:    obs.StatusCode,
+			StatusClass:   obs.StatusClass,
+			LatencyMs:     obs.LatencyMs,
+			BodySizeBytes: obs.BodySizeBytes,
+			RemoteIP:      obs.RemoteIP,
+			Country:       obs.Country,
+			UserAgent:     obs.UserAgent,
+		})
+	}
+	return out, nil
+}
 func matchesMonitoringQuery(obs domain.HookObservation, q domain.MonitoringQuery) bool {
 	if obs.ObservedAt.Before(q.From) || obs.ObservedAt.After(q.To) {
 		return false

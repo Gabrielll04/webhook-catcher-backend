@@ -11,10 +11,12 @@ import (
 )
 
 const (
-	defaultMonitoringWindow  = 15 * time.Minute
-	maxMonitoringWindow      = 30 * 24 * time.Hour
-	healthErrorRateThreshold = 2.0
-	healthP95ThresholdMs     = int64(500)
+	defaultMonitoringWindow        = 15 * time.Minute
+	maxMonitoringWindow            = 30 * 24 * time.Hour
+	healthErrorRateThreshold       = 2.0
+	healthP95ThresholdMs           = int64(500)
+	defaultMonitoringLiveSnapshot  = 50
+	maxMonitoringLiveSnapshotLimit = 500
 )
 
 type HookObservationInput struct {
@@ -173,6 +175,20 @@ func (s *Services) GetMonitoringInboxHealth(ctx context.Context, q domain.Monito
 		})
 	}
 	return items, nil
+}
+
+func (s *Services) GetMonitoringLiveSnapshot(ctx context.Context, q domain.MonitoringQuery, limit int) ([]domain.MonitoringLiveEvent, error) {
+	normalized, err := normalizeMonitoringQuery(q)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = defaultMonitoringLiveSnapshot
+	}
+	if limit > maxMonitoringLiveSnapshotLimit {
+		limit = maxMonitoringLiveSnapshotLimit
+	}
+	return s.store.ListMonitoringLiveEvents(ctx, normalized, limit)
 }
 
 func normalizeMonitoringQuery(q domain.MonitoringQuery) (domain.MonitoringQuery, error) {

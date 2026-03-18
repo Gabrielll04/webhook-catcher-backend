@@ -654,6 +654,69 @@ func TestMonitoringEndpointsAndLiveStream(t *testing.T) {
 		t.Fatalf("expected state in health response")
 	}
 }
+func TestMonitoringLiveStreamInitialSnapshot(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "snapshot"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+	token := created["token"].(string)
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token, bytes.NewBufferString("{\"ok\":true}"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("send hook: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+
+	streamReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/monitoring/live?inbox_id="+inboxID+"&limit=10", nil)
+	streamReq.Header.Set("Accept", "text/event-stream")
+	streamResp, err := http.DefaultClient.Do(streamReq)
+	if err != nil {
+		t.Fatalf("open monitoring stream: %v", err)
+	}
+	defer streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(streamResp.Body)
+		t.Fatalf("expected 200 stream, got %d body=%s", streamResp.StatusCode, string(body))
+	}
+
+	reader := bufio.NewReader(streamResp.Body)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			t.Fatalf("stream read failed: %v", readErr)
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+		if event["inbox_id"] == inboxID {
+			return
+		}
+	}
+	t.Fatal("timeout waiting initial snapshot event")
+}
 func TestRouterAcceptsTrailingSlashes(t *testing.T) {
 	h := app.NewWithStore(config.Config{
 		MaxPayloadBytes:      1024 * 1024,

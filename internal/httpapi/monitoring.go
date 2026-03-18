@@ -80,9 +80,31 @@ func (a *API) handleMonitoringInboxesHealth(w http.ResponseWriter, r *http.Reque
 
 func (a *API) handleMonitoringLiveStream(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	q, err := readMonitoringQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invalido", nil)
+		return
+	}
+	snapshotLimit := parseIntDefault(r.URL.Query().Get("limit"), 50)
+	if snapshotLimit <= 0 {
+		snapshotLimit = 50
+	}
+	if snapshotLimit > 500 {
+		snapshotLimit = 500
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, reqID, "stream_not_supported", "Streaming nao suportado", nil)
+		return
+	}
+
+	events, cancel := a.sse.Subscribe(monitoringLiveChannelKey)
+	defer cancel()
+
+	snapshot, err := a.services.GetMonitoringLiveSnapshot(r.Context(), q, snapshotLimit)
+	if err != nil {
+		a.handleServiceError(w, reqID, err)
 		return
 	}
 
@@ -94,8 +116,14 @@ func (a *API) handleMonitoringLiveStream(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write([]byte(": connected\n\n"))
 	flusher.Flush()
 
-	events, cancel := a.sse.Subscribe(monitoringLiveChannelKey)
-	defer cancel()
+	for _, item := range snapshot {
+		payload, marshalErr := json.Marshal(item)
+		if marshalErr != nil {
+			continue
+		}
+		a.writeMonitoringSSEPayload(w, flusher, payload)
+	}
+
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 	for {
@@ -106,15 +134,7 @@ func (a *API) handleMonitoringLiveStream(w http.ResponseWriter, r *http.Request)
 			if !ok {
 				return
 			}
-			_, _ = w.Write([]byte("event: hook_observation\n"))
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(payload)
-			_, _ = w.Write([]byte("\n\n"))
-			// Compatibility for clients using EventSource.onmessage.
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(payload)
-			_, _ = w.Write([]byte("\n\n"))
-			flusher.Flush()
+			a.writeMonitoringSSEPayload(w, flusher, payload)
 		case <-heartbeat.C:
 			_, _ = w.Write([]byte(": ping\n\n"))
 			flusher.Flush()
@@ -122,6 +142,17 @@ func (a *API) handleMonitoringLiveStream(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (a *API) writeMonitoringSSEPayload(w http.ResponseWriter, flusher http.Flusher, payload []byte) {
+	_, _ = w.Write([]byte("event: hook_observation\n"))
+	_, _ = w.Write([]byte("data: "))
+	_, _ = w.Write(payload)
+	_, _ = w.Write([]byte("\n\n"))
+	// Compatibility for clients using EventSource.onmessage.
+	_, _ = w.Write([]byte("data: "))
+	_, _ = w.Write(payload)
+	_, _ = w.Write([]byte("\n\n"))
+	flusher.Flush()
+}
 func (a *API) publishMonitoringLiveEvent(event *domain.MonitoringLiveEvent) {
 	if event == nil {
 		return
