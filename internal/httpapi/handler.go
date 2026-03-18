@@ -49,8 +49,9 @@ type idempotencyEntry struct {
 }
 
 const (
-	maxAdminPayloadBytes = 1024 * 1024
-	idempotencyTTL       = 24 * time.Hour
+	maxAdminPayloadBytes  = 1024 * 1024
+	idempotencyTTL        = 24 * time.Hour
+	idempotencyMaxEntries = 10000
 )
 
 func New(cfg config.Config, services *service.Services, logger *logging.Logger, recorder metrics.Recorder) *API {
@@ -587,15 +588,17 @@ func (a *API) readIdempotencyResponse(method, path, key string) (int, []byte, bo
 	now := time.Now().UTC()
 	a.idempoMu.Lock()
 	defer a.idempoMu.Unlock()
-	for k, v := range a.idempoResponses {
-		if now.After(v.ExpiresAt) {
-			delete(a.idempoResponses, k)
-		}
-	}
+	a.purgeExpiredIdempotencyLocked(now)
+
 	entry, ok := a.idempoResponses[cacheKey]
-	if !ok || now.After(entry.ExpiresAt) {
+	if !ok {
 		return 0, nil, false
 	}
+	if now.After(entry.ExpiresAt) {
+		delete(a.idempoResponses, cacheKey)
+		return 0, nil, false
+	}
+
 	body := make([]byte, len(entry.Body))
 	copy(body, entry.Body)
 	return entry.StatusCode, body, true
@@ -608,13 +611,42 @@ func (a *API) storeIdempotencyResponse(method, path, key string, statusCode int,
 	cacheKey := method + ":" + path + ":" + key
 	bodyCopy := make([]byte, len(body))
 	copy(bodyCopy, body)
+
+	now := time.Now().UTC()
 	a.idempoMu.Lock()
+	a.purgeExpiredIdempotencyLocked(now)
 	a.idempoResponses[cacheKey] = idempotencyEntry{
 		StatusCode: statusCode,
 		Body:       bodyCopy,
-		ExpiresAt:  time.Now().UTC().Add(idempotencyTTL),
+		ExpiresAt:  now.Add(idempotencyTTL),
 	}
+	a.enforceIdempotencyCapLocked()
 	a.idempoMu.Unlock()
+}
+
+func (a *API) purgeExpiredIdempotencyLocked(now time.Time) {
+	for k, v := range a.idempoResponses {
+		if now.After(v.ExpiresAt) {
+			delete(a.idempoResponses, k)
+		}
+	}
+}
+
+func (a *API) enforceIdempotencyCapLocked() {
+	for len(a.idempoResponses) > idempotencyMaxEntries {
+		oldestKey := ""
+		var oldestExpiresAt time.Time
+		for k, v := range a.idempoResponses {
+			if oldestKey == "" || v.ExpiresAt.Before(oldestExpiresAt) {
+				oldestKey = k
+				oldestExpiresAt = v.ExpiresAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(a.idempoResponses, oldestKey)
+	}
 }
 
 func isAllowedCaptureMethod(method string) bool {
