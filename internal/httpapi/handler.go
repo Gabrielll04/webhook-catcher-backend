@@ -255,11 +255,15 @@ func (a *API) handleListInboxes(w http.ResponseWriter, r *http.Request) {
 		a.handleServiceError(w, reqID, err)
 		return
 	}
+	meta := buildPaginationMeta(total, page)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"data":      items,
-		"page":      page.Page,
-		"page_size": page.PageSize,
-		"total":     total,
+		"data":        items,
+		"page":        meta["page"],
+		"page_size":   meta["page_size"],
+		"total":       meta["total"],
+		"total_pages": meta["total_pages"],
+		"has_next":    meta["has_next"],
+		"has_prev":    meta["has_prev"],
 	})
 }
 
@@ -458,11 +462,15 @@ func (a *API) handleListRequests(w http.ResponseWriter, r *http.Request, inboxID
 		a.handleServiceError(w, reqID, err)
 		return
 	}
+	meta := buildPaginationMeta(total, page)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"data":      items,
-		"page":      page.Page,
-		"page_size": page.PageSize,
-		"total":     total,
+		"data":        items,
+		"page":        meta["page"],
+		"page_size":   meta["page_size"],
+		"total":       meta["total"],
+		"total_pages": meta["total_pages"],
+		"has_next":    meta["has_next"],
+		"has_prev":    meta["has_prev"],
 	})
 }
 
@@ -476,20 +484,23 @@ func (a *API) handleGetRequestDetails(w http.ResponseWriter, r *http.Request, in
 	writeJSON(w, http.StatusOK, map[string]any{
 		"inbox": inbox,
 		"request": map[string]any{
-			"id":              item.ID,
-			"inbox_id":        item.InboxID,
-			"method":          item.Method,
-			"path":            item.Path,
-			"query_params":    item.QueryParams,
-			"headers":         item.Headers,
-			"body_raw_base64": base64.StdEncoding.EncodeToString(item.BodyRaw),
-			"body_size_bytes": item.BodySizeBytes,
-			"content_type":    item.ContentType,
-			"remote_ip":       item.RemoteIP,
-			"user_agent":      item.UserAgent,
-			"received_at":     item.ReceivedAt.UTC().Format(time.RFC3339Nano),
-			"request_hash":    item.RequestHash,
-			"truncated_body":  item.TruncatedBody,
+			"id":                item.ID,
+			"inbox_id":          item.InboxID,
+			"method":            item.Method,
+			"path":              item.Path,
+			"query_params":      item.QueryParams,
+			"query_params_json": item.QueryParams,
+			"headers":           item.Headers,
+			"headers_json":      item.Headers,
+			"body_raw":          string(item.BodyRaw),
+			"body_raw_base64":   base64.StdEncoding.EncodeToString(item.BodyRaw),
+			"body_size_bytes":   item.BodySizeBytes,
+			"content_type":      item.ContentType,
+			"remote_ip":         item.RemoteIP,
+			"user_agent":        item.UserAgent,
+			"received_at":       item.ReceivedAt.UTC().Format(time.RFC3339Nano),
+			"request_hash":      item.RequestHash,
+			"truncated_body":    item.TruncatedBody,
 		},
 	})
 }
@@ -738,16 +749,18 @@ func readFilter(r *http.Request) (domain.ListFilter, error) {
 	}
 	order := q.Get("order")
 	if order == "" {
-		if strings.HasPrefix(sortBy, "-") {
-			order = "desc"
-		} else {
-			order = "desc"
-		}
+		order = "desc"
 	}
+
 	filter := domain.ListFilter{
-		Method:      q.Get("method"),
-		ContentType: q.Get("content_type"),
-		Order:       order,
+		Method:            q.Get("method"),
+		ContentType:       q.Get("content_type"),
+		Order:             order,
+		PathContains:      q.Get("path_contains"),
+		RemoteIP:          q.Get("remote_ip"),
+		UserAgentContains: q.Get("user_agent_contains"),
+		RequestHash:       q.Get("request_hash"),
+		TextQuery:         q.Get("q"),
 	}
 	if hasBody := q.Get("has_body"); hasBody != "" {
 		value, err := strconv.ParseBool(hasBody)
@@ -770,9 +783,40 @@ func readFilter(r *http.Request) (domain.ListFilter, error) {
 		}
 		filter.To = &t
 	}
+	if minSize := strings.TrimSpace(q.Get("min_body_size")); minSize != "" {
+		value, err := strconv.ParseInt(minSize, 10, 64)
+		if err != nil {
+			return domain.ListFilter{}, err
+		}
+		filter.MinBodySize = &value
+	}
+	if maxSize := strings.TrimSpace(q.Get("max_body_size")); maxSize != "" {
+		value, err := strconv.ParseInt(maxSize, 10, 64)
+		if err != nil {
+			return domain.ListFilter{}, err
+		}
+		filter.MaxBodySize = &value
+	}
 	return filter, nil
 }
 
+func buildPaginationMeta(total int, page domain.Pagination) map[string]any {
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + page.PageSize - 1) / page.PageSize
+	}
+	hasPrev := page.Page > 1
+	hasNext := totalPages > 0 && page.Page < totalPages
+
+	return map[string]any{
+		"page":        page.Page,
+		"page_size":   page.PageSize,
+		"total":       total,
+		"total_pages": totalPages,
+		"has_next":    hasNext,
+		"has_prev":    hasPrev,
+	}
+}
 func parseIntDefault(v string, fallback int) int {
 	if v == "" {
 		return fallback

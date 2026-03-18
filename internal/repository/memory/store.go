@@ -141,16 +141,37 @@ func (s *Store) ListCapturedRequests(_ context.Context, inboxID string, filter d
 		if filter.ContentType != "" && req.ContentType != filter.ContentType {
 			continue
 		}
+		if filter.PathContains != "" && !strings.Contains(strings.ToLower(req.Path), strings.ToLower(filter.PathContains)) {
+			continue
+		}
+		if filter.RemoteIP != "" && req.RemoteIP != filter.RemoteIP {
+			continue
+		}
+		if filter.UserAgentContains != "" && !strings.Contains(strings.ToLower(req.UserAgent), strings.ToLower(filter.UserAgentContains)) {
+			continue
+		}
+		if filter.RequestHash != "" && req.RequestHash != filter.RequestHash {
+			continue
+		}
 		if filter.HasBody != nil {
 			hasBody := req.BodySizeBytes > 0
 			if *filter.HasBody != hasBody {
 				continue
 			}
 		}
+		if filter.MinBodySize != nil && req.BodySizeBytes < *filter.MinBodySize {
+			continue
+		}
+		if filter.MaxBodySize != nil && req.BodySizeBytes > *filter.MaxBodySize {
+			continue
+		}
 		if filter.From != nil && req.ReceivedAt.Before(*filter.From) {
 			continue
 		}
 		if filter.To != nil && req.ReceivedAt.After(*filter.To) {
+			continue
+		}
+		if filter.TextQuery != "" && !matchesTextQuery(req, filter.TextQuery) {
 			continue
 		}
 		items = append(items, req)
@@ -168,6 +189,7 @@ func (s *Store) ListCapturedRequests(_ context.Context, inboxID string, filter d
 		rows = append(rows, domain.CapturedRequestSummary{
 			ID:            item.ID,
 			Method:        item.Method,
+			Path:          item.Path,
 			ContentType:   item.ContentType,
 			BodySizeBytes: item.BodySizeBytes,
 			RemoteIP:      item.RemoteIP,
@@ -226,6 +248,32 @@ func (s *Store) Ping(context.Context) error {
 	return nil
 }
 
+func matchesTextQuery(req domain.CapturedRequest, query string) bool {
+	needle := strings.ToLower(strings.TrimSpace(query))
+	if needle == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(req.Path), needle) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(req.ContentType), needle) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(req.UserAgent), needle) {
+		return true
+	}
+	for k, v := range req.Headers {
+		if strings.Contains(strings.ToLower(k), needle) || strings.Contains(strings.ToLower(v), needle) {
+			return true
+		}
+	}
+	for k, v := range req.QueryParams {
+		if strings.Contains(strings.ToLower(k), needle) || strings.Contains(strings.ToLower(v), needle) {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(string(req.BodyRaw)), needle)
+}
 func paginateInboxes(items []domain.Inbox, page domain.Pagination) []domain.Inbox {
 	start, end := rangeFromPage(len(items), page)
 	if start >= len(items) {

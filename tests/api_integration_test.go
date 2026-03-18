@@ -59,6 +59,12 @@ func TestEndToEndInboxCaptureAndQuery(t *testing.T) {
 	if len(listBody.Data) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(listBody.Data))
 	}
+	if _, ok := listBody.Data[0]["path"].(string); !ok {
+		t.Fatalf("expected path in list summary")
+	}
+	if _, ok := listBody.Data[0]["received_at"].(string); !ok {
+		t.Fatalf("expected received_at string in list summary")
+	}
 	requestID := listBody.Data[0]["id"].(string)
 
 	detailResp := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests/"+requestID, nil, nil)
@@ -67,8 +73,18 @@ func TestEndToEndInboxCaptureAndQuery(t *testing.T) {
 	}
 	var details map[string]any
 	decodeResp(t, detailResp, &details)
-	if _, ok := details["request"]; !ok {
+	reqObj, ok := details["request"].(map[string]any)
+	if !ok {
 		t.Fatalf("expected request payload in detail response")
+	}
+	if _, ok := reqObj["headers"].(map[string]any); !ok {
+		t.Fatalf("expected headers in detail response")
+	}
+	if _, ok := reqObj["body_raw"].(string); !ok {
+		t.Fatalf("expected body_raw in detail response")
+	}
+	if _, ok := reqObj["received_at"].(string); !ok {
+		t.Fatalf("expected received_at in detail response")
 	}
 }
 
@@ -351,6 +367,158 @@ func TestInboxStreamReceivesCapturedRequest(t *testing.T) {
 		t.Fatalf("stream read failed: %v", readErr)
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for stream event")
+	}
+}
+func TestExtendedRequestFilters(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "filters"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+	token := created["token"].(string)
+
+	reqA, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token+"?source=alpha", bytes.NewBufferString("{\"kind\":\"alpha\"}"))
+	reqA.Header.Set("Content-Type", "application/json")
+	reqA.Header.Set("User-Agent", "alpha-bot")
+	respA, err := http.DefaultClient.Do(reqA)
+	if err != nil {
+		t.Fatalf("hook request A failed: %v", err)
+	}
+	respA.Body.Close()
+	if respA.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 for request A, got %d", respA.StatusCode)
+	}
+
+	reqB, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token+"?source=beta", bytes.NewBufferString("{\"kind\":\"beta\",\"tag\":\"needle\"}"))
+	reqB.Header.Set("Content-Type", "application/json")
+	reqB.Header.Set("User-Agent", "beta-client")
+	respB, err := http.DefaultClient.Do(reqB)
+	if err != nil {
+		t.Fatalf("hook request B failed: %v", err)
+	}
+	respB.Body.Close()
+	if respB.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 for request B, got %d", respB.StatusCode)
+	}
+
+	byUA := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?user_agent_contains=beta", nil, nil)
+	if byUA.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 user_agent filter, got %d", byUA.StatusCode)
+	}
+	var byUABody struct {
+		Total float64 `json:"total"`
+		Data  []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	decodeResp(t, byUA, &byUABody)
+	if int(byUABody.Total) != 1 || len(byUABody.Data) != 1 {
+		t.Fatalf("expected one result for user_agent filter, got total=%d len=%d", int(byUABody.Total), len(byUABody.Data))
+	}
+
+	byText := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?q=needle", nil, nil)
+	if byText.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 text query, got %d", byText.StatusCode)
+	}
+	var byTextBody struct {
+		Total float64 `json:"total"`
+	}
+	decodeResp(t, byText, &byTextBody)
+	if int(byTextBody.Total) != 1 {
+		t.Fatalf("expected one result for q filter, got %d", int(byTextBody.Total))
+	}
+
+	bySize := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?min_body_size=1&max_body_size=25", nil, nil)
+	if bySize.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 size filter, got %d", bySize.StatusCode)
+	}
+	var bySizeBody struct {
+		Total float64 `json:"total"`
+	}
+	decodeResp(t, bySize, &bySizeBody)
+	if int(bySizeBody.Total) == 0 {
+		t.Fatalf("expected at least one result for size filter")
+	}
+
+	invalidSize := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?min_body_size=50&max_body_size=10", nil, nil)
+	if invalidSize.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid size range, got %d", invalidSize.StatusCode)
+	}
+	assertErrorEnvelope(t, invalidSize)
+}
+func TestRequestsPaginationMetadata(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      1024 * 1024,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "pagination"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+	token := created["token"].(string)
+
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token, bytes.NewBufferString("{\"n\":1}"))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("hook request failed: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("expected 204 hook, got %d", resp.StatusCode)
+		}
+	}
+
+	page1 := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?page=1&page_size=2", nil, nil)
+	if page1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", page1.StatusCode)
+	}
+	var page1Body struct {
+		Data       []map[string]any `json:"data"`
+		Total      float64          `json:"total"`
+		TotalPages float64          `json:"total_pages"`
+		HasNext    bool             `json:"has_next"`
+		HasPrev    bool             `json:"has_prev"`
+	}
+	decodeResp(t, page1, &page1Body)
+	if len(page1Body.Data) != 2 || int(page1Body.Total) != 3 || int(page1Body.TotalPages) != 2 || !page1Body.HasNext || page1Body.HasPrev {
+		t.Fatalf("unexpected page1 metadata: len=%d total=%d pages=%d next=%v prev=%v", len(page1Body.Data), int(page1Body.Total), int(page1Body.TotalPages), page1Body.HasNext, page1Body.HasPrev)
+	}
+
+	page2 := doJSON(t, ts, http.MethodGet, "/v1/inboxes/"+inboxID+"/requests?page=2&page_size=2", nil, nil)
+	if page2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", page2.StatusCode)
+	}
+	var page2Body struct {
+		Data       []map[string]any `json:"data"`
+		Total      float64          `json:"total"`
+		TotalPages float64          `json:"total_pages"`
+		HasNext    bool             `json:"has_next"`
+		HasPrev    bool             `json:"has_prev"`
+	}
+	decodeResp(t, page2, &page2Body)
+	if len(page2Body.Data) != 1 || int(page2Body.Total) != 3 || int(page2Body.TotalPages) != 2 || page2Body.HasNext || !page2Body.HasPrev {
+		t.Fatalf("unexpected page2 metadata: len=%d total=%d pages=%d next=%v prev=%v", len(page2Body.Data), int(page2Body.Total), int(page2Body.TotalPages), page2Body.HasNext, page2Body.HasPrev)
 	}
 }
 func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, headers map[string]string) *http.Response {

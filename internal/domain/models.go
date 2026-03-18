@@ -43,6 +43,7 @@ type CapturedRequest struct {
 type CapturedRequestSummary struct {
 	ID            string    `json:"id"`
 	Method        string    `json:"method"`
+	Path          string    `json:"path"`
 	ContentType   string    `json:"content_type"`
 	BodySizeBytes int64     `json:"body_size_bytes"`
 	RemoteIP      string    `json:"remote_ip"`
@@ -57,12 +58,19 @@ type InboxPatch struct {
 }
 
 type ListFilter struct {
-	Method      string
-	ContentType string
-	HasBody     *bool
-	From        *time.Time
-	To          *time.Time
-	Order       string
+	Method            string
+	ContentType       string
+	HasBody           *bool
+	From              *time.Time
+	To                *time.Time
+	Order             string
+	PathContains      string
+	RemoteIP          string
+	UserAgentContains string
+	RequestHash       string
+	MinBodySize       *int64
+	MaxBodySize       *int64
+	TextQuery         string
 }
 
 type Pagination struct {

@@ -219,12 +219,36 @@ func (s *Store) ListCapturedRequests(ctx context.Context, inboxID string, filter
 		where = append(where, "content_type = ?")
 		args = append(args, filter.ContentType)
 	}
+	if filter.PathContains != "" {
+		where = append(where, "LOWER(path) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.PathContains)+"%")
+	}
+	if filter.RemoteIP != "" {
+		where = append(where, "remote_ip = ?")
+		args = append(args, filter.RemoteIP)
+	}
+	if filter.UserAgentContains != "" {
+		where = append(where, "LOWER(user_agent) LIKE ?")
+		args = append(args, "%"+strings.ToLower(filter.UserAgentContains)+"%")
+	}
+	if filter.RequestHash != "" {
+		where = append(where, "request_hash = ?")
+		args = append(args, filter.RequestHash)
+	}
 	if filter.HasBody != nil {
 		if *filter.HasBody {
 			where = append(where, "body_size_bytes > 0")
 		} else {
 			where = append(where, "body_size_bytes = 0")
 		}
+	}
+	if filter.MinBodySize != nil {
+		where = append(where, "body_size_bytes >= ?")
+		args = append(args, *filter.MinBodySize)
+	}
+	if filter.MaxBodySize != nil {
+		where = append(where, "body_size_bytes <= ?")
+		args = append(args, *filter.MaxBodySize)
 	}
 	if filter.From != nil {
 		where = append(where, "received_at >= ?")
@@ -233,6 +257,11 @@ func (s *Store) ListCapturedRequests(ctx context.Context, inboxID string, filter
 	if filter.To != nil {
 		where = append(where, "received_at <= ?")
 		args = append(args, filter.To.UTC().Format(time.RFC3339Nano))
+	}
+	if filter.TextQuery != "" {
+		needle := "%" + strings.ToLower(filter.TextQuery) + "%"
+		where = append(where, "(LOWER(path) LIKE ? OR LOWER(user_agent) LIKE ? OR LOWER(headers_json) LIKE ? OR LOWER(query_params_json) LIKE ? OR LOWER(CAST(body_raw AS TEXT)) LIKE ?)")
+		args = append(args, needle, needle, needle, needle, needle)
 	}
 
 	whereClause := strings.Join(where, " AND ")
@@ -248,7 +277,7 @@ func (s *Store) ListCapturedRequests(ctx context.Context, inboxID string, filter
 	}
 	limit, offset := normalizePagination(page)
 	queryQ := fmt.Sprintf(`
-		SELECT id,method,content_type,body_size_bytes,remote_ip,received_at
+		SELECT id,method,path,content_type,body_size_bytes,remote_ip,received_at
 		FROM captured_requests
 		WHERE %s
 		ORDER BY received_at %s
@@ -267,6 +296,7 @@ func (s *Store) ListCapturedRequests(ctx context.Context, inboxID string, filter
 		if err := rows.Scan(
 			&item.ID,
 			&item.Method,
+			&item.Path,
 			&item.ContentType,
 			&item.BodySizeBytes,
 			&item.RemoteIP,

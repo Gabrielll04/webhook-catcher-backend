@@ -181,6 +181,15 @@ func (s *Services) ListRequests(ctx context.Context, inboxID string, filter doma
 	if filter.Order != "" && !strings.EqualFold(filter.Order, "asc") && !strings.EqualFold(filter.Order, "desc") {
 		return nil, 0, domain.ErrInvalidInput
 	}
+	if filter.MinBodySize != nil && *filter.MinBodySize < 0 {
+		return nil, 0, domain.ErrInvalidInput
+	}
+	if filter.MaxBodySize != nil && *filter.MaxBodySize < 0 {
+		return nil, 0, domain.ErrInvalidInput
+	}
+	if filter.MinBodySize != nil && filter.MaxBodySize != nil && *filter.MinBodySize > *filter.MaxBodySize {
+		return nil, 0, domain.ErrInvalidInput
+	}
 	if filter.Order == "" {
 		filter.Order = "desc"
 	}
