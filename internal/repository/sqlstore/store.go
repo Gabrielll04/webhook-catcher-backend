@@ -418,6 +418,18 @@ func (s *Store) DeleteExpiredCapturedRequests(ctx context.Context, now time.Time
 		}
 		deleted += n
 	}
+
+	monitoringCutoff := now.UTC().AddDate(0, 0, -defaultRetentionDays)
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM monitoring_hook_events WHERE observed_at < ?", monitoringCutoff.Format(time.RFC3339Nano)); err != nil {
+		return deleted, err
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM monitoring_minute_rollups WHERE bucket_minute < ?", monitoringCutoff.Truncate(time.Minute).Format(time.RFC3339)); err != nil {
+		return deleted, err
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM monitoring_minute_dimensions WHERE bucket_minute < ?", monitoringCutoff.Truncate(time.Minute).Format(time.RFC3339)); err != nil {
+		return deleted, err
+	}
+
 	return deleted, nil
 }
 

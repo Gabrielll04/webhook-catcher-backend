@@ -91,7 +91,7 @@ func (a *API) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		headers := flattenHeaders(r.Header)
 		if !a.access.Validate(headers) {
-			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Access não autorizado", nil)
+			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Access nÃ£o autorizado", nil)
 			a.logRequest(r, reqID, http.StatusUnauthorized, start)
 			a.metrics.RouteLatency(ctx, routeKey(r), http.StatusUnauthorized, time.Since(start).Milliseconds())
 			return
@@ -118,7 +118,7 @@ func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/ready" {
 		if err := a.services.Ready(r.Context()); err != nil {
-			writeError(w, http.StatusServiceUnavailable, reqID, "not_ready", "DependÃƒÂªncias indisponÃƒÂ­veis", nil)
+			writeError(w, http.StatusServiceUnavailable, reqID, "not_ready", "DependÃƒÆ’Ã‚Âªncias indisponÃƒÆ’Ã‚Â­veis", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
@@ -132,11 +132,15 @@ func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
 		a.handleCapture(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/v1/monitoring") {
+		a.handleMonitoring(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/inboxes") {
 		a.handleInboxes(w, r)
 		return
 	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÂ£o encontrada", nil)
+	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÆ’Ã‚Â£o encontrada", nil)
 }
 
 func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +153,7 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			a.handleListInboxes(w, r)
 		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
+			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
 		}
 		return
 	}
@@ -163,7 +167,7 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		case http.MethodDelete:
 			a.handleDeleteInbox(w, r, id)
 		default:
-			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
+			writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
 		}
 		return
 	}
@@ -179,7 +183,7 @@ func (a *API) handleInboxes(w http.ResponseWriter, r *http.Request) {
 		a.handleGetRequestDetails(w, r, segments[2], segments[4])
 		return
 	}
-	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÂ£o encontrada", nil)
+	writeError(w, http.StatusNotFound, reqID, "route_not_found", "Rota nÃƒÆ’Ã‚Â£o encontrada", nil)
 }
 
 type createInboxReq struct {
@@ -326,38 +330,76 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+
+	startedAt := time.Now().UTC()
+	responseStatus := 0
+	obsInboxID := ""
+	body := []byte{}
+	contentType := r.Header.Get("Content-Type")
+	defer func() {
+		if responseStatus == 0 {
+			return
+		}
+		event, err := a.services.RecordHookObservation(r.Context(), service.HookObservationInput{
+			ObservedAt:    startedAt,
+			InboxID:       obsInboxID,
+			Method:        method,
+			Path:          r.URL.Path,
+			StatusCode:    responseStatus,
+			LatencyMs:     time.Since(startedAt).Milliseconds(),
+			BodySizeBytes: int64(len(body)),
+			HasBody:       len(body) > 0,
+			RemoteIP:      clientIP(r),
+			UserAgent:     r.UserAgent(),
+			Country:       requestCountry(r),
+			ContentType:   contentType,
+		})
+		if err == nil {
+			a.publishMonitoringLiveEvent(event)
+		}
+	}()
+
 	if !isAllowedCaptureMethod(method) {
-		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "Metodo nao suportado", nil)
+		responseStatus = http.StatusMethodNotAllowed
+		writeError(w, responseStatus, reqID, "method_not_allowed", "Metodo nao suportado", nil)
 		return
 	}
 
 	token := strings.TrimPrefix(r.URL.Path, "/hook/")
 	if token == "" {
-		writeError(w, http.StatusNotFound, reqID, "inbox_not_found", "Inbox nao encontrada", nil)
+		responseStatus = http.StatusNotFound
+		writeError(w, responseStatus, reqID, "inbox_not_found", "Inbox nao encontrada", nil)
 		return
+	}
+	if inboxID, err := a.services.ResolveInboxIDByToken(r.Context(), token); err == nil {
+		obsInboxID = inboxID
 	}
 
 	if err := a.services.ValidateCaptureTarget(r.Context(), token); err != nil {
+		responseStatus = statusCodeFromServiceError(err)
 		a.handleServiceError(w, reqID, err)
 		return
 	}
 
 	limited := io.LimitReader(r.Body, a.cfg.MaxPayloadBytes+1)
-	body, err := io.ReadAll(limited)
+	var err error
+	body, err = io.ReadAll(limited)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "malformed_request", "Nao foi possivel ler o payload", nil)
+		responseStatus = http.StatusBadRequest
+		writeError(w, responseStatus, reqID, "malformed_request", "Nao foi possivel ler o payload", nil)
 		return
 	}
 	if int64(len(body)) > a.cfg.MaxPayloadBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, reqID, "payload_too_large", "Payload acima do limite", map[string]any{"max_bytes": a.cfg.MaxPayloadBytes})
+		responseStatus = http.StatusRequestEntityTooLarge
+		writeError(w, responseStatus, reqID, "payload_too_large", "Payload acima do limite", map[string]any{"max_bytes": a.cfg.MaxPayloadBytes})
 		return
 	}
 	if requiresPayload(method) && len(bytes.TrimSpace(body)) == 0 {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_payload", "Payload vazio nao permitido", nil)
+		responseStatus = http.StatusBadRequest
+		writeError(w, responseStatus, reqID, "invalid_payload", "Payload vazio nao permitido", nil)
 		return
 	}
 
-	receivedAt := time.Now().UTC()
 	captured, err := a.services.CaptureRequest(r.Context(), service.CaptureInput{
 		Token:       token,
 		Method:      method,
@@ -365,12 +407,13 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 		QueryParams: service.ExtractQueryParams(r),
 		Headers:     service.ExtractHeaders(r),
 		BodyRaw:     body,
-		ContentType: r.Header.Get("Content-Type"),
+		ContentType: contentType,
 		RemoteIP:    clientIP(r),
 		UserAgent:   r.UserAgent(),
-		ReceivedAt:  receivedAt,
+		ReceivedAt:  startedAt,
 	})
 	if err != nil {
+		responseStatus = statusCodeFromServiceError(err)
 		a.handleServiceError(w, reqID, err)
 		if !errors.Is(err, domain.ErrNotFound) && !errors.Is(err, domain.ErrInboxDisabled) {
 			a.metrics.PersistFailure(r.Context(), routeKey(r))
@@ -378,9 +421,11 @@ func (a *API) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	obsInboxID = captured.InboxID
+	responseStatus = http.StatusNoContent
 	a.metrics.CaptureRecorded(r.Context(), token, int64(len(body)))
 	a.publishCapturedRequest(captured)
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(responseStatus)
 }
 
 func (a *API) handleInboxStream(w http.ResponseWriter, r *http.Request, inboxID string) {
@@ -422,6 +467,10 @@ func (a *API) handleInboxStream(w http.ResponseWriter, r *http.Request, inboxID 
 			_, _ = w.Write([]byte("data: "))
 			_, _ = w.Write(payload)
 			_, _ = w.Write([]byte("\n\n"))
+			// Compatibility for clients using EventSource.onmessage.
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(payload)
+			_, _ = w.Write([]byte("\n\n"))
 			flusher.Flush()
 		case <-heartbeat.C:
 			_, _ = w.Write([]byte(": ping\n\n"))
@@ -454,7 +503,7 @@ func (a *API) handleListRequests(w http.ResponseWriter, r *http.Request, inboxID
 	page := readPage(r)
 	filter, err := readFilter(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invÃƒÂ¡lido", nil)
+		writeError(w, http.StatusBadRequest, reqID, "invalid_filter", "Filtro invÃƒÆ’Ã‚Â¡lido", nil)
 		return
 	}
 	items, total, err := a.services.ListRequests(r.Context(), inboxID, filter, page)
@@ -508,12 +557,12 @@ func (a *API) handleGetRequestDetails(w http.ResponseWriter, r *http.Request, in
 func (a *API) handleRetention(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÂ©todo nÃƒÂ£o suportado", nil)
+		writeError(w, http.StatusMethodNotAllowed, reqID, "method_not_allowed", "MÃƒÆ’Ã‚Â©todo nÃƒÆ’Ã‚Â£o suportado", nil)
 		return
 	}
 	if a.cfg.CronSecret != "" {
 		if r.Header.Get("X-Cron-Secret") != a.cfg.CronSecret {
-			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron nÃƒÂ£o autorizado", nil)
+			writeError(w, http.StatusUnauthorized, reqID, "unauthorized", "Cron nÃƒÆ’Ã‚Â£o autorizado", nil)
 			return
 		}
 	}
@@ -526,19 +575,37 @@ func (a *API) handleRetention(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleServiceError(w http.ResponseWriter, requestID string, err error) {
+	status := statusCodeFromServiceError(err)
 	switch {
 	case errors.Is(err, domain.ErrInvalidInput):
-		writeError(w, http.StatusBadRequest, requestID, "invalid_input", "Entrada inválida", nil)
+		writeError(w, status, requestID, "invalid_input", "Entrada invÃ¡lida", nil)
 	case errors.Is(err, domain.ErrNotFound):
-		writeError(w, http.StatusNotFound, requestID, "inbox_not_found", "Inbox não encontrada", nil)
+		writeError(w, status, requestID, "inbox_not_found", "Inbox nÃ£o encontrada", nil)
 	case errors.Is(err, domain.ErrInboxDisabled):
-		writeError(w, http.StatusConflict, requestID, "inbox_disabled", "Inbox desativada", nil)
+		writeError(w, status, requestID, "inbox_disabled", "Inbox desativada", nil)
 	case errors.Is(err, domain.ErrPayloadTooLarge):
-		writeError(w, http.StatusRequestEntityTooLarge, requestID, "payload_too_large", "Payload acima do limite", nil)
+		writeError(w, status, requestID, "payload_too_large", "Payload acima do limite", nil)
 	case errors.Is(err, domain.ErrConflict):
-		writeError(w, http.StatusConflict, requestID, "conflict", "Conflito de dados", nil)
+		writeError(w, status, requestID, "conflict", "Conflito de dados", nil)
 	default:
-		writeError(w, http.StatusInternalServerError, requestID, "internal_error", "Erro interno", nil)
+		writeError(w, status, requestID, "internal_error", "Erro interno", nil)
+	}
+}
+
+func statusCodeFromServiceError(err error) int {
+	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, domain.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, domain.ErrInboxDisabled):
+		return http.StatusConflict
+	case errors.Is(err, domain.ErrPayloadTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, domain.ErrConflict):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
 	}
 }
 
@@ -714,6 +781,13 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+func requestCountry(r *http.Request) string {
+	country := strings.TrimSpace(r.Header.Get("CF-IPCountry"))
+	if country == "" {
+		return "UNKNOWN"
+	}
+	return strings.ToUpper(country)
+}
 func maskSensitiveHeaders(headers map[string]string) map[string]string {
 	cloned := make(map[string]string, len(headers))
 	for k, v := range headers {
@@ -834,7 +908,7 @@ func (a *API) handleAdminCORS(w http.ResponseWriter, r *http.Request, reqID stri
 		return false
 	}
 	if !a.isOriginAllowed(origin) {
-		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem nÃƒÂ£o permitida por CORS", nil)
+		writeError(w, http.StatusForbidden, reqID, "cors_origin_not_allowed", "Origem nÃƒÆ’Ã‚Â£o permitida por CORS", nil)
 		a.logRequest(r, reqID, http.StatusForbidden, start)
 		a.metrics.RouteLatency(ctx, routeKey(r), http.StatusForbidden, time.Since(start).Milliseconds())
 		return true
@@ -888,6 +962,9 @@ func parseAllowedOrigins(raw string) (bool, map[string]struct{}) {
 func routeKey(r *http.Request) string {
 	if strings.HasPrefix(r.URL.Path, "/hook/") {
 		return "hook_capture"
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/monitoring") {
+		return "monitoring"
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/inboxes") {
 		return "inboxes"

@@ -11,15 +11,21 @@ import (
 )
 
 type Store struct {
-	mu       sync.RWMutex
-	inboxes  map[string]domain.Inbox
-	requests map[string]domain.CapturedRequest
+	mu               sync.RWMutex
+	inboxes          map[string]domain.Inbox
+	requests         map[string]domain.CapturedRequest
+	monitoringEvents []domain.HookObservation
+	minuteRollups    map[string]memoryMinuteRollup
+	minuteDims       map[string]int64
 }
 
 func New() *Store {
 	return &Store{
-		inboxes:  make(map[string]domain.Inbox),
-		requests: make(map[string]domain.CapturedRequest),
+		inboxes:          make(map[string]domain.Inbox),
+		requests:         make(map[string]domain.CapturedRequest),
+		monitoringEvents: make([]domain.HookObservation, 0),
+		minuteRollups:    make(map[string]memoryMinuteRollup),
+		minuteDims:       make(map[string]int64),
 	}
 }
 
@@ -229,6 +235,36 @@ func (s *Store) DeleteExpiredCapturedRequests(_ context.Context, now time.Time, 
 			deleted++
 		}
 	}
+
+	metricsCutoff := now.UTC().AddDate(0, 0, -defaultRetentionDays)
+	kept := make([]domain.HookObservation, 0, len(s.monitoringEvents))
+	for _, obs := range s.monitoringEvents {
+		if !obs.ObservedAt.Before(metricsCutoff) {
+			kept = append(kept, obs)
+		}
+	}
+	s.monitoringEvents = kept
+	for key := range s.minuteRollups {
+		parts := strings.SplitN(key, "|", 2)
+		if len(parts) < 1 {
+			continue
+		}
+		bucket, err := time.Parse(time.RFC3339, parts[0])
+		if err != nil || bucket.Before(metricsCutoff) {
+			delete(s.minuteRollups, key)
+		}
+	}
+	for key := range s.minuteDims {
+		parts := strings.SplitN(key, "|", 4)
+		if len(parts) < 1 {
+			continue
+		}
+		bucket, err := time.Parse(time.RFC3339, parts[0])
+		if err != nil || bucket.Before(metricsCutoff) {
+			delete(s.minuteDims, key)
+		}
+	}
+
 	return deleted, nil
 }
 

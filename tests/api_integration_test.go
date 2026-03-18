@@ -521,6 +521,139 @@ func TestRequestsPaginationMetadata(t *testing.T) {
 		t.Fatalf("unexpected page2 metadata: len=%d total=%d pages=%d next=%v prev=%v", len(page2Body.Data), int(page2Body.Total), int(page2Body.TotalPages), page2Body.HasNext, page2Body.HasPrev)
 	}
 }
+func TestMonitoringEndpointsAndLiveStream(t *testing.T) {
+	h := app.NewWithStore(config.Config{
+		MaxPayloadBytes:      16,
+		DefaultRetentionDays: 30,
+		AdminRateLimitRPM:    1000,
+		RequireAccess:        false,
+	}, memory.New())
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	createResp := doJSON(t, ts, http.MethodPost, "/v1/inboxes", map[string]any{"name": "monitoring"}, nil)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createResp.StatusCode)
+	}
+	var created map[string]any
+	decodeResp(t, createResp, &created)
+	inboxID := created["id"].(string)
+	token := created["token"].(string)
+
+	streamReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/monitoring/live", nil)
+	streamReq.Header.Set("Accept", "text/event-stream")
+	streamResp, err := http.DefaultClient.Do(streamReq)
+	if err != nil {
+		t.Fatalf("open monitoring stream: %v", err)
+	}
+	defer streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(streamResp.Body)
+		t.Fatalf("expected 200 stream, got %d body=%s", streamResp.StatusCode, string(body))
+	}
+
+	dataCh := make(chan string, 1)
+	go func() {
+		reader := bufio.NewReader(streamResp.Body)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				return
+			}
+			if strings.HasPrefix(line, "data: ") {
+				dataCh <- strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+				return
+			}
+		}
+	}()
+
+	reqOK, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token, bytes.NewBufferString("{\"ok\":true}"))
+	reqOK.Header.Set("Content-Type", "application/json")
+	respOK, err := http.DefaultClient.Do(reqOK)
+	if err != nil {
+		t.Fatalf("send hook ok: %v", err)
+	}
+	respOK.Body.Close()
+	if respOK.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", respOK.StatusCode)
+	}
+
+	reqLarge, _ := http.NewRequest(http.MethodPost, ts.URL+"/hook/"+token, bytes.NewBufferString("{\"payload\":\"12345678901234567890\"}"))
+	reqLarge.Header.Set("Content-Type", "application/json")
+	respLarge, err := http.DefaultClient.Do(reqLarge)
+	if err != nil {
+		t.Fatalf("send hook large: %v", err)
+	}
+	respLarge.Body.Close()
+	if respLarge.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", respLarge.StatusCode)
+	}
+
+	select {
+	case payload := <-dataCh:
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			t.Fatalf("invalid monitoring stream payload: %v", err)
+		}
+		if _, ok := event["status_code"].(float64); !ok {
+			t.Fatalf("expected status_code in live event")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting monitoring live event")
+	}
+
+	summaryResp := doJSON(t, ts, http.MethodGet, "/v1/monitoring/summary?inbox_id="+inboxID+"&from=now-15m&to=now", nil, nil)
+	if summaryResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 summary, got %d", summaryResp.StatusCode)
+	}
+	var summary struct {
+		RequestsTotal float64        `json:"requests_total"`
+		StatusCodes   map[string]any `json:"status_codes"`
+	}
+	decodeResp(t, summaryResp, &summary)
+	if int(summary.RequestsTotal) < 2 {
+		t.Fatalf("expected at least 2 requests in summary, got %d", int(summary.RequestsTotal))
+	}
+
+	timeseriesResp := doJSON(t, ts, http.MethodGet, "/v1/monitoring/timeseries?inbox_id="+inboxID+"&from=now-15m&to=now", nil, nil)
+	if timeseriesResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 timeseries, got %d", timeseriesResp.StatusCode)
+	}
+	var timeseries struct {
+		Data []map[string]any `json:"data"`
+	}
+	decodeResp(t, timeseriesResp, &timeseries)
+	if len(timeseries.Data) == 0 {
+		t.Fatalf("expected non-empty timeseries")
+	}
+
+	breakdownResp := doJSON(t, ts, http.MethodGet, "/v1/monitoring/breakdown?inbox_id="+inboxID+"&dimension=status&from=now-15m&to=now", nil, nil)
+	if breakdownResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 breakdown, got %d", breakdownResp.StatusCode)
+	}
+	var breakdown struct {
+		Data []map[string]any `json:"data"`
+	}
+	decodeResp(t, breakdownResp, &breakdown)
+	if len(breakdown.Data) == 0 {
+		t.Fatalf("expected non-empty breakdown")
+	}
+
+	healthResp := doJSON(t, ts, http.MethodGet, "/v1/monitoring/inboxes/health?inbox_id="+inboxID, nil, nil)
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 health, got %d", healthResp.StatusCode)
+	}
+	var health struct {
+		Data []map[string]any `json:"data"`
+	}
+	decodeResp(t, healthResp, &health)
+	if len(health.Data) != 1 {
+		t.Fatalf("expected one inbox health item, got %d", len(health.Data))
+	}
+	if state, _ := health.Data[0]["state"].(string); state == "" {
+		t.Fatalf("expected state in health response")
+	}
+}
 func doJSON(t *testing.T, ts *httptest.Server, method, path string, body any, headers map[string]string) *http.Response {
 	t.Helper()
 	var reader io.Reader
